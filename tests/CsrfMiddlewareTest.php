@@ -108,4 +108,59 @@ final class CsrfMiddlewareTest extends TestCase
         $this->assertCount(1, $cookies);
         $this->assertStringContainsString('XSRF-TOKEN=', $cookies[0]->toHeader());
     }
+
+    /**
+     * Проверим, что без CookieMiddleware (нет очереди cookie в запросе) cookie `XSRF-TOKEN` попадает в заголовки ответа.
+     *
+     * @see CsrfMiddleware::process()
+     */
+    #[Test]
+    public function attachesCookieToResponseWithoutQueue(): void
+    {
+        $response = new CsrfMiddleware(new Session(new SessionStoreSpy()))->process(
+            new ServerRequest('GET', 'https://example.com/'),
+            new class () implements RequestHandlerInterface {
+                public function handle(ServerRequestInterface $request): ResponseInterface
+                {
+                    return new Response(200);
+                }
+            },
+        );
+
+        self::assertStringStartsWith('XSRF-TOKEN=', $response->getHeaderLine('Set-Cookie'));
+    }
+
+    /**
+     * Проверим, что в cookie уходит токен, сменённый обработчиком (например, при входе), а не токен начала запроса.
+     *
+     * @see CsrfMiddleware::process()
+     */
+    #[Test]
+    public function attachesTokenChangedByHandler(): void
+    {
+        $session = new Session(new SessionStoreSpy());
+
+        $response = new CsrfMiddleware($session)->process(
+            new ServerRequest('GET', 'https://example.com/'),
+            new class ($session) implements RequestHandlerInterface {
+                public function __construct(
+                    private readonly Session $session,
+                ) {
+                }
+
+                public function handle(ServerRequestInterface $request): ResponseInterface
+                {
+                    $this->session->forget('csrf_token');
+
+                    return new Response(200, ['X-Old-Token' => (string) $request->getAttribute('csrf_token')]);
+                }
+            },
+        );
+
+        $token = $session->get('csrf_token');
+
+        self::assertIsString($token);
+        self::assertNotSame($response->getHeaderLine('X-Old-Token'), $token);
+        self::assertStringStartsWith('XSRF-TOKEN=' . $token . ';', $response->getHeaderLine('Set-Cookie'));
+    }
 }
