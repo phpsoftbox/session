@@ -95,9 +95,14 @@ final class CsrfMiddleware implements MiddlewareInterface
 
         $response = $handler->handle($request);
 
-        $this->attachCookie($request, $response, $token);
+        // Обработчик мог сменить токен (вход, выход) — в cookie уходит актуальный.
+        $current = $this->session->get($this->sessionKey);
+        if (!is_string($current) || $current === '') {
+            $current = $this->generateToken();
+            $this->session->set($this->sessionKey, $current);
+        }
 
-        return $response;
+        return $this->attachCookie($request, $response, $current);
     }
 
     private function attachCookie(ServerRequestInterface $request, ResponseInterface $response, string $token): ResponseInterface

@@ -11,19 +11,33 @@ use PhpSoftBox\Cookie\SetCookie;
 use PhpSoftBox\Database\Connection\ConnectionManagerInterface;
 use PhpSoftBox\Session\Config\SessionConfig;
 use Psr\Http\Message\ServerRequestInterface;
+use Throwable;
 
 use function bin2hex;
 use function is_array;
 use function is_int;
 use function is_string;
+use function preg_match;
 use function random_bytes;
 use function serialize;
 use function sprintf;
 use function trim;
 use function unserialize;
 
+/**
+ * Сессии в таблице БД.
+ *
+ * - Идентификатор из cookie принимается, только если он в формате генератора (64 hex) и сессия с ним есть в таблице и не
+ *   истекла; иначе выдаётся новый (strict mode: чужой заранее известный id не становится сессией).
+ * - Сессия истекает, если с последней активности прошло больше `gcMaxLifetime`, а если он не задан — `lifetime` (при
+ *   `lifetime > 0`). Без обоих настроек срок не проверяется, удаление — только `session:prune`.
+ * - Чтение и запись — через write-соединение: реплика может отставать.
+ * - После `write()` и `destroy()` состояние сбрасывается: объект переиспользуется в долгоживущем процессе.
+ */
 final class DatabaseSessionStore implements RequestAwareSessionStoreInterface
 {
+    private const string ID_PATTERN = '/^[a-f0-9]{64}$/';
+
     private bool $started                    = false;
     private ?ServerRequestInterface $request = null;
     private ?string $sessionId               = null;
@@ -68,8 +82,20 @@ final class DatabaseSessionStore implements RequestAwareSessionStoreInterface
             return;
         }
 
-        $this->sessionId = $this->resolveSessionId();
-        $row             = $this->findRow($this->sessionId);
+        $sessionId = $this->resolveSessionId();
+        $row       = $sessionId === null ? null : $this->findRow($sessionId);
+
+        if ($row !== null && $this->isExpired($row)) {
+            $this->deleteSession((string) $sessionId);
+            $row = null;
+        }
+
+        // Неизвестный или истёкший id не принимается: новая сессия получает новый id.
+        if ($row === null && $this->config->useStrictMode) {
+            $sessionId = null;
+        }
+
+        $this->sessionId = $sessionId ?? $this->generateSessionId();
         $this->data      = $row === null ? [] : $this->decodePayload($row[$this->payloadColumn] ?? null);
         $this->started   = true;
     }
@@ -90,12 +116,10 @@ final class DatabaseSessionStore implements RequestAwareSessionStoreInterface
             return;
         }
 
-        $this->data = $data;
         $this->persist($data);
         $this->queueCookie();
 
-        $this->started = false;
-        $this->request = null;
+        $this->reset();
     }
 
     public function regenerateId(bool $deleteOldSession = true): void
@@ -114,14 +138,22 @@ final class DatabaseSessionStore implements RequestAwareSessionStoreInterface
             $this->deleteSession($this->sessionId);
         }
 
+        $this->cookies->queue($this->forgetCookie());
+        $this->reset();
+    }
+
+    private function reset(): void
+    {
         $this->data      = [];
         $this->started   = false;
         $this->sessionId = null;
-        $this->cookies->queue($this->forgetCookie());
-        $this->request = null;
+        $this->request   = null;
     }
 
-    private function resolveSessionId(): string
+    /**
+     * Идентификатор из cookie, если он в формате генератора; иначе `null`.
+     */
+    private function resolveSessionId(): ?string
     {
         if ($this->sessionId !== null) {
             return $this->sessionId;
@@ -129,11 +161,28 @@ final class DatabaseSessionStore implements RequestAwareSessionStoreInterface
 
         $cookies = $this->request?->getCookieParams() ?? [];
         $value   = $cookies[$this->config->name] ?? null;
-        if (is_string($value) && trim($value) !== '') {
-            return trim($value);
+
+        return is_string($value) && preg_match(self::ID_PATTERN, $value) === 1 ? $value : null;
+    }
+
+    /**
+     * @param array<string, mixed> $row
+     */
+    private function isExpired(array $row): bool
+    {
+        $lifetime = $this->config->gcMaxLifetime ?? ($this->config->lifetime > 0 ? $this->config->lifetime : null);
+        if ($lifetime === null || $lifetime <= 0) {
+            return false;
         }
 
-        return $this->generateSessionId();
+        $lastActivity = $row[$this->lastActivityDatetimeColumn] ?? $row[$this->createdDatetimeColumn] ?? null;
+        if (!is_string($lastActivity) || $lastActivity === '') {
+            return false;
+        }
+
+        $threshold = new DateTimeImmutable('now', new DateTimeZone('UTC'))->modify(sprintf('-%d seconds', $lifetime));
+
+        return $lastActivity < $this->dateToStorage($threshold);
     }
 
     private function generateSessionId(): string
@@ -146,7 +195,7 @@ final class DatabaseSessionStore implements RequestAwareSessionStoreInterface
      */
     private function findRow(string $sessionId): ?array
     {
-        $conn = $this->connections->read($this->connectionName);
+        $conn = $this->connections->write($this->connectionName);
         $sql  = sprintf(
             'SELECT * FROM %s WHERE %s = :session_id LIMIT 1',
             $conn->table($this->table),
@@ -193,7 +242,13 @@ final class DatabaseSessionStore implements RequestAwareSessionStoreInterface
         ];
 
         $conn = $this->connections->write($this->connectionName);
-        if ($this->findRow($sessionId) === null) {
+        if ($this->findRow($sessionId) !== null) {
+            $this->update($sessionId, $row);
+
+            return;
+        }
+
+        try {
             $conn->query()
                 ->insert($this->table, [
                     $this->idColumn              => $sessionId,
@@ -201,11 +256,23 @@ final class DatabaseSessionStore implements RequestAwareSessionStoreInterface
                     ...$row,
                 ])
                 ->execute();
+        } catch (Throwable $exception) {
+            // Параллельный запрос той же новой сессии успел вставить строку — обновляем её.
+            if ($this->findRow($sessionId) === null) {
+                throw $exception;
+            }
 
-            return;
+            $this->update($sessionId, $row);
         }
+    }
 
-        $conn->query()
+    /**
+     * @param array<string, mixed> $row
+     */
+    private function update(string $sessionId, array $row): void
+    {
+        $this->connections->write($this->connectionName)
+            ->query()
             ->update($this->table, $row)
             ->where($this->idColumn . ' = :session_id', ['session_id' => $sessionId])
             ->execute();

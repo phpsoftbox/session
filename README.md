@@ -54,6 +54,17 @@ $session = new Session($store);
 `userIdKeys` связывает auth guard с ключом в payload сессии. Если ни один ключ
 не найден, store записывает `guard=guest` и `user_id=NULL`.
 
+Безопасность и долгоживущие процессы:
+
+- id из cookie принимается, только если он в формате генератора (64 hex) и такая сессия есть в таблице; неизвестный
+  или некорректный id заменяется новым (`useStrictMode`, по умолчанию включён) — заранее известный id не становится
+  сессией жертвы;
+- сессия, неактивная дольше `gcMaxLifetime` (если не задан — `lifetime`, при `lifetime > 0`), не читается и
+  удаляется сразу, не дожидаясь `session:prune`; без обеих настроек срок проверяет только `session:prune`;
+- чтение и запись идут через write-соединение (реплика может отставать); одновременная вставка одной новой сессии
+  не падает на уникальном индексе;
+- после `write()` и `destroy()` состояние store сбрасывается — объект можно держать синглтоном в воркере.
+
 Пример миграции лежит в `database/migrations`. В приложении её можно
 опубликовать через `db:migrate:publish --package=phpsoftbox/session`.
 
@@ -86,3 +97,7 @@ use PhpSoftBox\Session\Http\SessionMiddleware;
 $sessionMw = new SessionMiddleware($session);
 $csrfMw = new CsrfMiddleware($session);
 ```
+
+`CsrfMiddleware` отдаёт cookie `XSRF-TOKEN` через `CookieQueue` из атрибута запроса, а без `CookieMiddleware` —
+заголовком `Set-Cookie` ответа. В cookie уходит токен из сессии на момент ответа: если обработчик сменил его (вход,
+выход), клиент сразу получает новый.
